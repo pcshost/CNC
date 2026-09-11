@@ -1,0 +1,126 @@
+Here's my PvP Audio Alert Script. I use it during war. It should still work it's been a while since I used it. ;-)
+
+// ==UserScript==
+// @name         PVP Audio Attack Alert
+// @version      0.1
+// @include      http*://prodgame*.alliances.commandandconquer.com/*/index.aspx*
+// @include      http*://cncapp*.alliances.commandandconquer.com/*/index.aspx*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    var original_title = window.document.title;
+    var enable_sound = true; // false
+    var was_attacked = false;
+    var was_repairing = false;
+    var siren = "Global";
+
+//if(enable_sound) {
+    siren = new Audio('https://www.pcshost.com/attack.wav');
+    siren.addEventListener('ended', function() {
+        this.currentTime = 0;
+        this.play();
+    }, false);
+//}
+
+    function checkAlert() {
+        var in_background = true;
+        var new_title = "";
+        var is_alerted = false;
+
+        //if (document.hasFocus() == false) {
+        //    in_background = false;
+        //}
+
+        if(in_background) {
+
+            var mainData = ClientLib.Data.MainData.GetInstance();
+            var bases = mainData.get_Cities();
+            var all_bases = bases.get_AllCities().d;
+            var victim = "";
+
+            for (var key in all_bases) {
+               var current_base = all_bases[key];
+
+
+                if (!was_repairing)
+                {
+                    if(current_base.get_isAlerted() & current_base.get_isProtected() ) {
+                        was_repairing = true;
+                        is_alerted = true;
+                        was_attacked = false;
+                        victim = current_base.get_Name();
+                    }
+                }
+
+                if (!was_repairing)
+                {
+                    if(current_base.get_isAlerted()) {
+                        was_repairing = false;
+                        is_alerted = true;
+                        was_attacked = true;
+                        victim = current_base.get_Name();
+                    }
+                }
+
+
+
+            }
+        }
+
+        if(is_alerted)
+        {
+
+            if (!was_repairing)
+            {
+                window.document.title = 'ALERT - ' + victim + '!';
+                if(enable_sound) {
+                    siren.play();
+                }
+            }
+            else
+            {
+                    window.document.title = 'REPAIRING';
+            }
+        }
+        else
+        {
+            if (!was_repairing)
+            {
+                window.document.title = original_title;
+
+                if(enable_sound) {
+                    siren.pause();
+                    siren.currentTime = 0;
+                }
+
+                was_attacked = false;
+            }
+            else
+            {
+                window.document.title = original_title;
+                was_repairing = false;
+                was_attacked = false;
+            }
+        }
+    }
+
+    function makeFavicon(status) {
+        var link = document.createElement('link'),
+            new_href = "";
+
+        link.rel = 'shortcut icon';
+        link.href = new_href;
+
+        document.getElementsByTagName('head')[0].appendChild(link);
+    }
+
+    setInterval(function(){
+        checkAlert();
+    }, 5000);
+
+    console.log("* TA Alert * loaded!");
+
+})();
