@@ -1,0 +1,518 @@
+// ==UserScript==
+// @name         Tiberium Alliances - POI History V1.5
+// @namespace    http://tampermonkey.net/
+// @version      1.4-debug
+// @description  Shows alliance POI history, member changes, score chart and safe coordinate search
+// @match        https://*.alliances.commandandconquer.com/*/index.aspx*
+// @match        https://*.alliances.commandandconquer.com/*
+// @grant        none
+// @run-at       document-idle
+// @sandbox      raw
+// @noframes
+// ==/UserScript==
+
+(function () {
+	'use strict';
+	console.log('[POI History] userscript loaded', location.href);
+
+		function main() {
+
+			var CATEGORY  = 7;
+			var PAGE_SIZE = 100;
+
+			var POI_TYPES = {
+				2: "Tiberium: ", 3: "Crystal: ", 4: "Reactor: ", 5: "Tungsten: ",
+				6: "Uranium: ",  7: "Air: ",     8: "Resonator: "
+			};
+			var POI_COLORS = {
+				2: "#43a047", 3: "#1e88e5", 4: "#fb8c00", 5: "#8d6e63",
+				6: "#7cb342", 7: "#00acc1", 8: "#8e24aa"
+			};
+			var MEMBER_EVENTS = { 2: "Member added", 3: "Member left" };
+
+			var poiStore, totalPages, pagesLoaded, phaseComplete, outWindow, running = false;
+
+			function _getPValue(p, field) {
+				if (!p || !p.length) return null;
+				for (var j = 0; j < p.length; j++) if (p[j].t === field) return p[j].v;
+				return null;
+			}
+			function _decodeCoord(co) { return { x: co >> 16 & 65535, y: co & 65535 }; }
+			function _fmtCoords(x, y) {
+				if (x == null || y == null) return "";
+				function pad3(n) { n = String(n); while (n.length < 3) n = "0" + n; return n; }
+				return pad3(x) + ":" + pad3(y);
+			}
+			function _poiLabel(type) {
+				var label = POI_TYPES[type];
+				if (!label) return "Type " + type;
+				return label.replace(/:\s*$/, "");
+			}
+			function _formatTime(ms) {
+				var d = new Date(ms);
+				function pad(n) { return (n < 10 ? "0" : "") + n; }
+				return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+					+ " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+			}
+			function _fmtDateShort(ms) {
+				var d = new Date(ms);
+				function pad(n) { return (n < 10 ? "0" : "") + n; }
+				return pad(d.getMonth() + 1) + "/" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+			}
+			function _fmtNum(n) {
+				if (n === null || n === undefined || isNaN(n)) return "";
+				var neg = n < 0;
+				var s = String(Math.round(Math.abs(n)));
+				var out = "", c = 0;
+				for (var i = s.length - 1; i >= 0; i--) {
+					out = s[i] + out;
+					if (++c % 3 === 0 && i > 0) out = "," + out;
+				}
+				return (neg ? "-" : "") + out;
+			}
+			function _esc(v) {
+				return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+			}
+			function _cell(v) {
+				if (v === null || v === undefined || v === "") return "&mdash;";
+				return _esc(v);
+			}
+
+			function _delegate(fn) {
+				return webfrontend.phe.cnc.Util.createEventDelegate(ClientLib.Net.CommandResult, window, fn);
+			}
+
+			// ---------- Data loading ----------
+			function start() {
+				if (running) return;
+				running = true;
+				poiStore = {};
+				totalPages = 0;
+				pagesLoaded = 0;
+				phaseComplete = false;
+
+				// Open the tab now (inside the click) so the popup blocker allows it
+				outWindow = window.open("", "_blank");
+				if (outWindow) {
+					outWindow.document.write("<html><body style='font-family:Arial'>Loading POI history...</body></html>");
+				}
+
+				ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand(
+					"NotificationGetCount", { category: CATEGORY }, _delegate(_onRowCountCompleted), null);
+			}
+
+			function _onRowCountCompleted(n, t) {
+				var total = t;
+				if (!total || total <= 0) {
+					running = false;
+					if (outWindow) outWindow.document.body.innerHTML = "No POI notifications found.";
+					return;
+				}
+				totalPages = Math.ceil(total / PAGE_SIZE);
+				pagesLoaded = 0;
+				for (var from = 0; from < total; from += PAGE_SIZE) {
+					_loadRowData(from, Math.min(from + PAGE_SIZE - 1, total - 1));
+				}
+			}
+
+			function _loadRowData(n, t) {
+				ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand(
+					"NotificationGetRange",
+					{ category: CATEGORY, skip: n, take: t - n + 1, sortOrder: 0, ascending: false },
+					_delegate(_onLoadRowData), null);
+			}
+
+			function _onLoadRowData(i, u) {
+				if (u && u.length) {
+					for (var r = 0; r < u.length; r++) {
+						var row = u[r];
+						var co = _getPValue(row.p, "co");
+						var coord = (co != null) ? _decodeCoord(co) : { x: null, y: null };
+						poiStore[row.id] = {
+							id: row.id, mdb: row.mdb, t: row.t,
+							pon: _getPValue(row.p, "pon"),
+							pol: _getPValue(row.p, "pol"),
+							pos: _getPValue(row.p, "pos"),
+							pot: _getPValue(row.p, "pot"),
+							co: co, x: coord.x, y: coord.y
+						};
+					}
+				}
+				pagesLoaded++;
+				if (pagesLoaded >= totalPages) _onPhaseComplete();
+			}
+
+			function _onPhaseComplete() {
+				if (phaseComplete) return;
+				phaseComplete = true;
+				running = false;
+
+				var timeline = buildTimeline();
+				var timelineHTML = _renderTimelineHTML(timeline);
+				var historySeries = buildHistorySeries();
+				var chartHTML = _renderChartHTML(historySeries);
+
+				console.log("[poiNotifications] ready: " + timeline.length + " events, " + historySeries.length + " series");
+
+				var htmlContent = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>POI History</title></head><body style='background:#f2f4f8;padding:16px'>"
+					+ chartHTML + "<div style='height:18px'></div>" + _renderSearchHTML() + timelineHTML + "</body></html>";
+
+				if (outWindow && !outWindow.closed) {
+					outWindow.document.open();
+					outWindow.document.write(htmlContent);
+					outWindow.document.close();
+					_attachSearchHandlers(outWindow);
+				} else {
+					var blob = new Blob([htmlContent], { type: "text/html" });
+					window.open(URL.createObjectURL(blob), "_blank");
+				}
+			}
+
+			// ---------- Game data ----------
+			function loadCurrentPOIScores() {
+				var pois = ClientLib.Data.MainData.GetInstance().get_Alliance().get_OwnedPOIs();
+				var scores = {};
+				for (var type in POI_TYPES) if (POI_TYPES.hasOwnProperty(type)) scores[type] = 0;
+
+				if (pois && pois.length) {
+					for (var i = 0; i < pois.length; i++) {
+						var poi = pois[i];
+						if (!(poi.t in scores)) continue;
+						scores[poi.t] += ClientLib.Base.PointOfInterestTypes.GetScoreByLevel(poi.l);
+					}
+				}
+				return scores;
+			}
+
+			function getMemberChanges() {
+				var history = ClientLib.Data.MainData.GetInstance().get_Alliance().get_History();
+				var out = [];
+				if (history && history.length) {
+					for (var i = 0; i < history.length; i++) {
+						var entry = history[i];
+						if (!(entry.EventType in MEMBER_EVENTS)) continue;
+						out.push({
+							EventType: entry.EventType,
+							PlayerName: entry.PlayerName,
+							Time: entry.Time.getTime()
+						});
+					}
+				}
+				return out;
+			}
+
+			function buildTimeline() {
+				var events = [];
+				for (var key in poiStore) {
+					if (!poiStore.hasOwnProperty(key)) continue;
+					var p = poiStore[key];
+					events.push({
+						time: p.t, kind: "poi", event: _poiLabel(p.pon), player: "",
+						mdb: p.mdb, level: p.pol, score: p.pos, bonus: p.pot,
+						coords: _fmtCoords(p.x, p.y)
+					});
+				}
+				var members = getMemberChanges();
+				for (var i = 0; i < members.length; i++) {
+					var m = members[i];
+					events.push({
+						time: m.Time, kind: "member", event: MEMBER_EVENTS[m.EventType],
+						player: m.PlayerName, mdb: null, level: null, score: null, bonus: null, coords: ""
+					});
+				}
+				for (var j = 0; j < events.length; j++) events[j]._i = j;
+				events.sort(function (a, b) { return (a.time - b.time) || (a._i - b._i); });
+				return events;
+			}
+
+			function buildHistorySeries() {
+				var current = loadCurrentPOIScores();
+				var byType = {};
+				for (var key in poiStore) {
+					if (!poiStore.hasOwnProperty(key)) continue;
+					var p = poiStore[key];
+					if (!byType[p.pon]) byType[p.pon] = [];
+					byType[p.pon].push({ time: p.t, delta: (p.mdb === 45 ? -p.pos : p.pos) });
+				}
+
+				var series = [];
+				for (var type in POI_TYPES) {
+					if (!POI_TYPES.hasOwnProperty(type)) continue;
+					var evs = byType[type];
+					if (!evs || !evs.length) continue;
+
+					evs.sort(function (a, b) { return b.time - a.time; });
+					var running = current[type] || 0;
+					var pts = [];
+					for (var i = 0; i < evs.length; i++) {
+						pts.push({ time: evs[i].time, value: running });
+						running -= evs[i].delta;
+					}
+					pts.reverse();
+					series.push({ type: +type, label: _poiLabel(type), color: POI_COLORS[type], points: pts });
+				}
+				return series;
+			}
+
+			// ---------- Rendering ----------
+			var _STYLES =
+			'<style>'
+			+ '.poi-timeline{border-collapse:collapse;font-family:"Segoe UI",Arial,sans-serif;font-size:13px;background:#fff;border:1px solid #e2e6ee;border-radius:8px;overflow:hidden}'
+			+ '.poi-timeline th{background:#2b2f3a;color:#fff;text-align:left;padding:8px 12px;font-weight:600;letter-spacing:.3px}'
+			+ '.poi-timeline td{padding:7px 12px;border-bottom:1px solid #eef1f6;color:#2b2f3a}'
+			+ '.poi-timeline tbody tr:nth-child(even){background:#f8fafc}'
+			+ '.poi-timeline tbody tr:hover{background:#eef4ff}'
+			+ '.poi-timeline .num{text-align:right;font-variant-numeric:tabular-nums}'
+			+ '.poi-timeline .time{font-variant-numeric:tabular-nums;white-space:nowrap;color:#5a6273}'
+			+ '.poi-timeline .neg{color:#c0392b;font-weight:600}'
+			+ '.poi-timeline .pos{color:#1e7e34}'
+			+ '.poi-timeline .coords{font-family:Consolas,Menlo,monospace;color:#5a6273}'
+			+ '.poi-timeline tr.member td{background:#fbf6ec}'
+			+ '.poi-timeline tr.member:hover td{background:#f6ecd8}'
+			+ '.poi-chart{font-family:"Segoe UI",Arial,sans-serif;background:#fff;border:1px solid #e2e6ee;border-radius:8px;padding:14px 16px}'
+			+ '.poi-chart h3{margin:0 0 10px;font-size:15px;color:#2b2f3a}'
+			+ '.chart-legend{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin-bottom:10px}'
+			+ '.chart-legend .chip{font-size:12px;color:#444;display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:3px 6px;border-radius:6px}'
+			+ '.chart-legend .chip:hover{background:#eef2f8}'
+			+ '.chart-legend .chip i{width:12px;height:12px;border-radius:3px;display:inline-block}'
+			+ '.chart-legend .chip input{margin:0;cursor:pointer}'
+			+ '.chart-legend .btns{margin-left:auto;display:inline-flex;gap:6px}'
+			+ '.poi-btn{font-family:inherit;font-size:12px;padding:4px 10px;border:1px solid #c9d0da;background:#f5f7fa;color:#334155;border-radius:6px;cursor:pointer}'
+			+ '.poi-btn:hover{background:#e9edf3}'
+			+ '.poi-chart svg{width:100%;height:auto;display:block}'
+			+ '.poi-search{font-family:"Segoe UI",Arial,sans-serif;background:#fff;border:1px solid #e2e6ee;border-radius:8px;padding:12px 14px;margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}'
+			+ '.poi-search label{font-weight:600;color:#2b2f3a}'
+			+ '.poi-search input{padding:6px 9px;border:1px solid #c9d0da;border-radius:5px;font:13px Consolas,monospace;width:125px}'
+			+ '.poi-search .status{font-size:12px;color:#5a6273;margin-left:4px}'
+			+ '</style>';
+
+			function _renderSearchHTML() {
+				return '<div class="poi-search">'
+					+ '<label for="poiCoordSearch">Search POI Coordinates:</label>'
+					+ '<input id="poiCoordSearch" type="text" placeholder="123:456" maxlength="9">'
+					+ '<button id="poiSearchBtn" type="button" class="poi-btn">Search</button>'
+					+ '<button id="poiClearBtn" type="button" class="poi-btn">Clear</button>'
+					+ '<span class="status" id="poiSearchStatus">Enter coordinates as 123:456, 123,456 or 123 456.</span>'
+					+ '</div>';
+			}
+
+			function _attachSearchHandlers(w) {
+				if (!w || w.closed || !w.document) return;
+				var d = w.document;
+				var input = d.getElementById("poiCoordSearch");
+				var searchBtn = d.getElementById("poiSearchBtn");
+				var clearBtn = d.getElementById("poiClearBtn");
+				var status = d.getElementById("poiSearchStatus");
+				if (!input || !searchBtn || !clearBtn || !status) return;
+
+				function normalize(v) {
+					var m = String(v || "").trim().match(/^(\d{1,3})\s*[: ,]\s*(\d{1,3})$/);
+					if (!m) return null;
+					return ("000" + m[1]).slice(-3) + ":" + ("000" + m[2]).slice(-3);
+				}
+
+				function filter() {
+					var q = normalize(input.value);
+					if (!q) { status.textContent = "Invalid coordinates. Try 123:456."; return; }
+					var rows = d.querySelectorAll("#poiTimelineBody tr");
+					var n = 0;
+					for (var i = 0; i < rows.length; i++) {
+						var c = rows[i].getAttribute("data-coords");
+						var show = (c === q);
+						rows[i].style.display = show ? "" : "none";
+						if (show) n++;
+					}
+					status.textContent = n ? (n + " history event" + (n === 1 ? "" : "s") + " found for " + q + ".") : ("No POI history found for " + q + ".");
+				}
+
+				function clear() {
+					input.value = "";
+					var rows = d.querySelectorAll("#poiTimelineBody tr");
+					for (var i = 0; i < rows.length; i++) rows[i].style.display = "";
+					status.textContent = "Showing complete history.";
+				}
+
+				searchBtn.addEventListener("click", filter);
+				clearBtn.addEventListener("click", clear);
+				input.addEventListener("keydown", function(e) { if (e.key === "Enter") filter(); });
+			}
+
+			function _renderTimelineHTML(timeline) {
+				var html = _STYLES;
+				html += '<table class="poi-timeline"><thead><tr>'
+					+ '<th>Time</th><th>Event</th><th>Player</th>'
+					+ '<th class="num">Level</th><th class="num">Score</th><th class="num">Coords</th>'
+					+ '</tr></thead><tbody id="poiTimelineBody">';
+
+				for (var i = 0; i < timeline.length; i++) {
+					var e = timeline[i];
+					var playerCell, levelCell, scoreCell, coordsCell;
+					if (e.kind === "poi") {
+						var signed = (e.mdb === 45 ? -e.score : e.score);
+						playerCell = '<td>' + _cell("") + '</td>';
+						levelCell  = '<td class="num">' + _cell(e.level) + '</td>';
+						scoreCell  = '<td class="num ' + (signed < 0 ? 'neg' : 'pos') + '">' + _fmtNum(signed) + '</td>';
+						coordsCell = '<td class="num coords">' + _cell(e.coords) + '</td>';
+					} else {
+						playerCell = '<td>' + _esc(e.player) + '</td>';
+						levelCell  = '<td class="num">' + _cell("") + '</td>';
+						scoreCell  = '<td class="num">' + _cell("") + '</td>';
+						coordsCell = '<td class="num">' + _cell("") + '</td>';
+					}
+					html += '<tr class="' + e.kind + '" data-coords="' + (e.kind === 'poi' ? _esc(e.coords) : '') + '">'
+						+ '<td class="time">' + _formatTime(e.time) + '</td>'
+						+ '<td>' + _cell(e.event) + '</td>'
+						+ playerCell + levelCell + scoreCell + coordsCell + '</tr>';
+				}
+				return html + '</tbody></table>';
+			}
+
+			function _renderChartSVG(series) {
+				var empty = '<div class="chart-empty">No POI changes to plot.</div>';
+				if (!series || !series.length) return empty;
+
+				var tMin = Infinity, tMax = -Infinity, vMax = 0;
+				for (var s = 0; s < series.length; s++) {
+					var pts = series[s].points;
+					for (var i = 0; i < pts.length; i++) {
+						if (pts[i].time < tMin) tMin = pts[i].time;
+						if (pts[i].time > tMax) tMax = pts[i].time;
+						if (pts[i].value > vMax) vMax = pts[i].value;
+					}
+				}
+				if (!isFinite(tMin)) return empty;
+				if (tMin === tMax) tMax = tMin + 1;
+				var yLo = 0, yHi = (vMax * 1.08) || 100;
+
+				var W = 960, H = 440, mL = 78, mR = 24, mT = 24, mB = 56;
+				var pw = W - mL - mR, ph = H - mT - mB;
+				function xScale(t) { return mL + (t - tMin) / (tMax - tMin) * pw; }
+				function yScale(v) { return mT + (1 - (v - yLo) / (yHi - yLo)) * ph; }
+
+				var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial, sans-serif">';
+				svg += '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#ffffff"/>';
+
+				for (var g = 0; g <= 5; g++) {
+					var val = yLo + (yHi - yLo) * g / 5;
+					var yy = yScale(val);
+					svg += '<line x1="' + mL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - mR) + '" y2="' + yy.toFixed(1) + '" stroke="#eceff3"/>';
+					svg += '<text x="' + (mL - 8) + '" y="' + (yy + 4).toFixed(1) + '" text-anchor="end" font-size="11" fill="#6b7280">' + _fmtNum(Math.round(val)) + '</text>';
+				}
+				for (var h = 0; h <= 6; h++) {
+					var tt = tMin + (tMax - tMin) * h / 6;
+					var xx = xScale(tt);
+					svg += '<line x1="' + xx.toFixed(1) + '" y1="' + mT + '" x2="' + xx.toFixed(1) + '" y2="' + (H - mB) + '" stroke="#f3f5f8"/>';
+					svg += '<text x="' + xx.toFixed(1) + '" y="' + (H - mB + 18) + '" text-anchor="middle" font-size="11" fill="#6b7280">' + _fmtDateShort(tt) + '</text>';
+				}
+				svg += '<line x1="' + mL + '" y1="' + (H - mB) + '" x2="' + (W - mR) + '" y2="' + (H - mB) + '" stroke="#c9d0da" stroke-width="1.5"/>';
+				svg += '<line x1="' + mL + '" y1="' + mT + '" x2="' + mL + '" y2="' + (H - mB) + '" stroke="#c9d0da" stroke-width="1.5"/>';
+
+				for (var s2 = 0; s2 < series.length; s2++) {
+					var ser = series[s2];
+					svg += '<g id="poiseries_' + ser.type + '">';
+					var coordStr = "";
+					for (var i2 = 0; i2 < ser.points.length; i2++) {
+						coordStr += xScale(ser.points[i2].time).toFixed(1) + "," + yScale(ser.points[i2].value).toFixed(1) + " ";
+					}
+					svg += '<polyline fill="none" stroke="' + ser.color + '" stroke-width="2" stroke-linejoin="round" points="' + coordStr.replace(/\s+$/, "") + '"/>';
+					for (var i3 = 0; i3 < ser.points.length; i3++) {
+						svg += '<circle cx="' + xScale(ser.points[i3].time).toFixed(1) + '" cy="' + yScale(ser.points[i3].value).toFixed(1) + '" r="3" fill="' + ser.color + '"><title>'
+							+ _esc(ser.label) + ': ' + _fmtNum(ser.points[i3].value) + ' (' + _formatTime(ser.points[i3].time) + ')</title></circle>';
+					}
+					svg += '</g>';
+				}
+				return svg + '</svg>';
+			}
+
+			var _H_TOGGLE  = "onchange=\"var g=document.getElementById('poiseries_'+this.value);if(g){g.style.display=this.checked?'':'none'}this.parentNode.style.opacity=this.checked?1:0.45\"";
+			var _H_SHOWALL = "onclick=\"var l=document.getElementById('poilegend');var b=l.getElementsByTagName('input');for(var i=0;i<b.length;i++){if(b[i].type==='checkbox'){b[i].checked=true;b[i].parentNode.style.opacity=1;var g=document.getElementById('poiseries_'+b[i].value);if(g)g.style.display=''}}\"";
+			var _H_HIDEALL = "onclick=\"var l=document.getElementById('poilegend');var b=l.getElementsByTagName('input');for(var i=0;i<b.length;i++){if(b[i].type==='checkbox'){b[i].checked=false;b[i].parentNode.style.opacity=0.45;var g=document.getElementById('poiseries_'+b[i].value);if(g)g.style.display='none'}}\"";
+
+			function _renderChartHTML(series) {
+				var html = _STYLES;
+				html += '<div class="poi-chart"><h3>POI Score History</h3><div class="chart-legend" id="poilegend">';
+				for (var i = 0; i < series.length; i++) {
+					html += '<label class="chip"><input type="checkbox" value="' + series[i].type + '" checked ' + _H_TOGGLE + '>'
+						+ '<i style="background:' + series[i].color + '"></i>' + _esc(series[i].label) + '</label>';
+				}
+				html += '<span class="btns">'
+					+ '<button type="button" class="poi-btn" ' + _H_SHOWALL + '>Show all</button>'
+					+ '<button type="button" class="poi-btn" ' + _H_HIDEALL + '>Hide all</button>'
+					+ '</span></div>' + _renderChartSVG(series) + '</div>';
+				return html;
+			}
+
+			// ---------- Draggable launch button ----------
+			var btn = document.createElement("button");
+			btn.textContent = "POI History";
+			btn.style.cssText = "position:fixed;right:8px;bottom:8px;z-index:100000;padding:8px 14px;"
+				+ "background:#d00000;color:#ffff00;border:2px solid #ffff00;border-radius:7px;"
+				+ "cursor:pointer;font:bold 13px Arial;box-shadow:0 2px 8px rgba(0,0,0,.45);user-select:none";
+
+			try {
+				var saved = JSON.parse(localStorage.getItem("poiHistoryButtonPosition"));
+				if (saved && saved.left != null && saved.top != null) {
+					btn.style.left = saved.left + "px";
+					btn.style.top = saved.top + "px";
+					btn.style.right = "auto";
+					btn.style.bottom = "auto";
+				}
+			} catch (e) {}
+
+			var dragging = false, moved = false, offsetX = 0, offsetY = 0;
+			btn.addEventListener("mousedown", function (e) {
+				if (e.button !== 0) return;
+				dragging = true; moved = false;
+				var rect = btn.getBoundingClientRect();
+				offsetX = e.clientX - rect.left; offsetY = e.clientY - rect.top;
+				btn.style.left = rect.left + "px"; btn.style.top = rect.top + "px";
+				btn.style.right = "auto"; btn.style.bottom = "auto";
+				e.preventDefault();
+			});
+			document.addEventListener("mousemove", function (e) {
+				if (!dragging) return;
+				moved = true;
+				var left = Math.max(0, Math.min(e.clientX - offsetX, window.innerWidth - btn.offsetWidth));
+				var top = Math.max(0, Math.min(e.clientY - offsetY, window.innerHeight - btn.offsetHeight));
+				btn.style.left = left + "px"; btn.style.top = top + "px";
+			});
+			document.addEventListener("mouseup", function () {
+				if (!dragging) return;
+				dragging = false;
+				if (moved) try { localStorage.setItem("poiHistoryButtonPosition", JSON.stringify({
+					left: parseInt(btn.style.left, 10), top: parseInt(btn.style.top, 10)
+				})); } catch (e) {}
+			});
+			btn.addEventListener("click", function () {
+				if (moved) { moved = false; return; }
+				try { start(); }
+				catch (e) { running = false; console.error("[POI History]", e); alert("POI History failed: " + e.message); }
+			});
+			document.body.appendChild(btn);
+		}
+
+		// ---------- Wait for the game to be ready ----------
+		var waitCount = 0;
+		function waitForGame() {
+			waitCount++;
+			try {
+				if (typeof qx !== "undefined" && typeof ClientLib !== "undefined" &&
+					typeof webfrontend !== "undefined" &&
+					qx.core.Init.getApplication() &&
+					ClientLib.Data.MainData.GetInstance().get_Alliance() &&
+					ClientLib.Data.MainData.GetInstance().get_Player().get_Name()) {
+					main();
+					return;
+				}
+			} catch (e) {
+				if (waitCount === 1 || waitCount % 10 === 0) console.warn("[POI History] waiting for game", e);
+			}
+			if (waitCount === 10) {
+				console.warn("[POI History] Still waiting after 10 seconds", {
+					qx: typeof qx, ClientLib: typeof ClientLib, webfrontend: typeof webfrontend
+				});
+			}
+			setTimeout(waitForGame, 1000);
+		}
+		waitForGame();
+})();
