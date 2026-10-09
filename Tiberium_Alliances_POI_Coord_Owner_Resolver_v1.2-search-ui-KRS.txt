@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Tiberium Alliances - POI Coord Owner Resolver
+// @name         Tiberium Alliances - POI Coord Owner Resolver - KRS
 // @namespace    http://tampermonkey.net/
 // @version      1.2
 // @description  Searchable POI coordinate/owner resolver for the top 10 alliances.
