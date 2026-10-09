@@ -1,0 +1,27 @@
+How POI Owner Resolver v2.1 Works
+
+- Identifies your alliance: Uses the alliance of the player currently logged into Tiberium Alliances.
+- Retrieves your alliance's POI loss history: Reads the game's POI loss notifications to identify coordinates of POIs your alliance previously lost.
+- Identifies the Top 10 alliances: Retrieves the current Top 10 alliances from the game's rankings.
+- Retrieves current POI ownership: Queries each of those alliances to obtain its currently owned POIs, including coordinates, type, and level.
+- Matches lost POIs to current owners: Determines whether any of your alliance's previously lost POIs are currently owned by one of the Top 10 alliances.
+- Provides three views:
+- Our Lost POIs: Historical losses and their current owners, when identifiable.
+- Current Top 10 POIs: All POIs currently reported as owned by the Top 10 alliances.
+- Observed Changes: Ownership differences detected between saved checks.
+- Establishes an ownership baseline: On the first run, saves a snapshot of current POI ownership without treating existing POIs as ownership changes.
+- Tracks future changes: Compares each subsequent snapshot against the previous one, recording changes in ownership, newly observed POIs, and POIs no longer listed.
+- Provides coordinate search: Allows you to locate a specific POI by its X:Y coordinates.
+- Filters by alliance: Allows you to narrow the results to a particular alliance.
+- Refreshes on demand: Retrieves updated game information when the script loads or you click Refresh Data.
+- Preserves tracking information: Saves snapshots and observed changes in your browser's local storage, allowing tracking to continue across sessions.
+- Provides an accessible interface: Uses a draggable red button with yellow lettering to open the results window.
+
+Important limitations
+- Current owner is not necessarily the alliance that captured the POI from you.
+- Only the current Top 10 alliances are checked for ownership.
+- Changes occurring between snapshots may be missed.
+- Historical loss information depends on notifications still available from the game.
+- The script does not continuously monitor ownership while you're playing.
+
+In summary: The resolver identifies POIs your alliance previously lost, shows who owns them today when the owner is among the Top 10, and builds a record of observed ownership changes going forward.

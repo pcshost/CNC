@@ -1,0 +1,158 @@
+// ==UserScript==
+// @name         Tiberium Alliances - POI Owner Resolver v2.1
+// @namespace    http://tampermonkey.net/
+// @version      2.1
+// @description  Our lost POIs, top-10 current POIs, and observed ownership changes.
+// @match        https://*.alliances.commandandconquer.com/*
+// @grant        none
+// @run-at       document-idle
+// @sandbox      raw
+// ==/UserScript==
+(function(){
+"use strict";
+var TYPES={2:"Tiberium",3:"Crystal",4:"Reactor",5:"Tungsten",6:"Uranium",7:"Air",8:"Resonator"};
+var COLORS={2:"#43a047",3:"#1e88e5",4:"#fb8c00",5:"#8d6e63",6:"#7cb342",7:"#00acc1",8:"#8e24aa"};
+var KEY="ta-poi-resolver-v2:"+location.host+":"+location.pathname.split("/").slice(0,3).join("/");
+var losses=[],current=[],changes=[],allianceNames={},loaded=false,busy=false,win=null,button=null,rankDone=false,notesDone=false,expected=0,received=0,errors=[];
+function log(){console.log.apply(console,["[POI Resolver v2]"].concat([].slice.call(arguments)));}
+function cmd(name,args,cb){
+ try{ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand(name,args,
+ webfrontend.phe.cnc.Util.createEventDelegate(ClientLib.Net.CommandResult,window,function(a,b){try{cb(b);}catch(e){errors.push(name+": "+e.message);log(e);}}),null);}
+ catch(e){errors.push(name+": "+e.message);log(e);cb(null);}
+}
+function param(p,k){if(!Array.isArray(p))return null;for(var i=0;i<p.length;i++)if(p[i].t===k)return p[i].v;return null;}
+function coord(v){var n=Number(v);if(!Number.isFinite(n))return null;return ((n>>>16)&65535)+":"+((n>>>0)&65535);}
+function norm(s){var m=String(s||"").trim().match(/^(\d{1,4})\s*[:,\s]\s*(\d{1,4})$/);return m?(+m[1])+":"+(+m[2]):"";}
+function time(v){var n=Number(v);if(!Number.isFinite(n))return "";if(n<1e11)n*=1000;var d=new Date(n);return isNaN(d.getTime())?"":d.toLocaleString();}
+function readSaved(){try{return JSON.parse(localStorage.getItem(KEY))||{};}catch(e){return {};}}
+function save(v){try{localStorage.setItem(KEY,JSON.stringify(v));}catch(e){log("Storage unavailable",e);}}
+function finish(){
+ if(!rankDone||!notesDone||received<expected)return;
+ busy=false;loaded=true;
+ var prior=readSaved(),hasBaseline=Object.prototype.hasOwnProperty.call(prior,"current"),old=prior.current||{},now={},observed=[];
+ current.forEach(function(p){now[p.coord]={ownerId:p.ownerId,owner:p.owner,type:p.type,level:p.level};});
+ // Changes are observations between snapshots, NOT proof of a direct capture.
+ if(hasBaseline)Object.keys(old).forEach(function(k){
+  var before=old[k],after=now[k];
+  if(!after)observed.push({coord:k,previous:before.owner,current:"Not in tracked Top 10",when:Date.now(),kind:"No longer listed"});
+  else if(String(before.ownerId)!==String(after.ownerId))
+   observed.push({coord:k,previous:before.owner,current:after.owner,when:Date.now(),kind:"Owner changed"});
+ });
+ if(hasBaseline)Object.keys(now).forEach(function(k){if(!old[k])observed.push({coord:k,previous:"Not in previous snapshot",current:now[k].owner,when:Date.now(),kind:"Newly observed"});});
+ changes=(prior.changes||[]).concat(observed).slice(-3000);
+ save({current:now,changes:changes,lastCheck:Date.now(),buttonPos:prior.buttonPos});
+ log("Loaded",losses.length,"loss notifications,",current.length,"current POIs,",changes.length,"observations");
+ if(win&&!win.closed)render(win.document);
+}
+function getNotes(){
+ cmd("NotificationGetCount",{category:7},function(t){
+  var count=Number(t)||0,done=0,pg=Math.ceil(count/100);
+  if(!pg){notesDone=true;finish();return;}
+  for(var from=0;from<count;from+=100)(function(skip){
+   cmd("NotificationGetRange",{category:7,skip:skip,take:Math.min(100,count-skip),sortOrder:0,ascending:false},function(rows){
+    if(Array.isArray(rows))rows.forEach(function(r){
+     if(Number(r.mdb)!==45)return;
+     var k=coord(param(r.p,"co"));if(!k)return;
+     losses.push({coord:k,type:param(r.p,"pon"),level:param(r.p,"pol"),score:param(r.p,"pos"),when:r.t,notification:r.id});
+    });
+    if(++done>=pg){notesDone=true;finish();}
+   });
+  })(from);
+ });
+}
+function getRanking(){
+ cmd("RankingGetData",{ascending:true,firstIndex:0,lastIndex:9,rankingType:0,searchValue:"",sortColumn:2,view:1},function(t){
+  var a=t&&Array.isArray(t.a)?t.a:[];
+  expected=a.filter(function(x){return x&&x.a!=null;}).length;received=0;
+  if(!expected){errors.push("No alliance ranking results.");rankDone=true;finish();return;}
+  a.forEach(function(x){
+   if(!x||x.a==null)return;
+   cmd("GetPublicAllianceInfo",{id:x.a},function(info){
+    if(info&&info.i!=null){
+     var id=info.i,name=info.n||("Alliance "+id);allianceNames[id]=name;
+     (Array.isArray(info.opois)?info.opois:[]).forEach(function(p){
+      if(p.x==null||p.y==null)return;
+      current.push({coord:(+p.x)+":"+(+p.y),owner:name,ownerId:id,type:p.t,level:p.l});
+     });
+    }else errors.push("Missing public POIs for alliance ID "+x.a);
+    if(++received>=expected){rankDone=true;finish();}
+   });
+  });
+ });
+}
+function refresh(){
+ if(busy)return;
+ busy=true;loaded=false;losses=[];current=[];errors=[];allianceNames={};rankDone=false;notesDone=false;expected=0;received=0;
+ if(win&&!win.closed)render(win.document);
+ getNotes();getRanking();
+}
+function make(tag,parent,text){var e=parent.createElement?parent.createElement(tag):document.createElement(tag);if(text!=null)e.textContent=String(text);return e;}
+function render(d){
+ d.body.textContent="";
+ var style=make("style",d);style.textContent="body{font:14px Segoe UI,Arial;background:#f3f5f9;color:#263142;margin:20px}h2{margin:0 0 10px}.wrap{background:white;padding:18px;border-radius:9px;border:1px solid #d9dee8}.tools{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}input,select,button{padding:8px;font:inherit}button{background:#ba0000;color:#ffeb00;border:0;border-radius:5px;cursor:pointer}.note{padding:10px;border-left:4px solid #b78024;background:#fff8e7;margin:12px 0}.muted{color:#657080}table{width:100%;border-collapse:collapse;margin-top:12px}th{background:#293443;color:white;text-align:left}td,th{padding:8px;border-bottom:1px solid #e5e9f0}tr:nth-child(even){background:#f7f9fc}";
+ d.head.appendChild(style);
+ var box=make("div",d);box.className="wrap";d.body.appendChild(box);
+ box.appendChild(make("h2",d,"POI Owner Resolver v2.1.0"));
+ var note=make("div",d);note.className="note";note.textContent="Important: “Current owner” means who owns the POI at the time of this lookup, NOT necessarily the alliance that captured it from us. Historical loss notifications do not prove who captured it. Ownership changes shown here are observations between saved checks, not a complete capture history. The first successful check establishes a baseline without recording changes. Only the current Top 10 alliances are checked; older game notifications may no longer be available.";box.appendChild(note);
+ var tools=make("div",d);tools.className="tools";box.appendChild(tools);
+ var view=make("select",d);
+ [["loss","Our Lost POIs"],["current","Current Top 10 POIs"],["changes","Observed Changes"]].forEach(function(a){var o=make("option",d,a[1]);o.value=a[0];view.appendChild(o);});
+ tools.appendChild(view);
+ var search=make("input",d);search.placeholder="Coordinates e.g. 123:456";tools.appendChild(search);
+ var alliance=make("select",d);tools.appendChild(alliance);
+ var refreshBtn=make("button",d,"Refresh Data");tools.appendChild(refreshBtn);
+ var status=make("div",d);status.className="muted";box.appendChild(status);
+ var table=make("table",d);box.appendChild(table);
+ function fillAlliances(){
+  alliance.textContent="";var o=make("option",d,"All alliances");o.value="";alliance.appendChild(o);
+  Object.keys(allianceNames).forEach(function(id){var opt=make("option",d,allianceNames[id]);opt.value=id;alliance.appendChild(opt);});
+ }
+ fillAlliances();
+ function draw(){
+  table.textContent="";
+  var kind=view.value,k=norm(search.value),aid=alliance.value;
+  var headers=kind==="loss"?["Lost at","Coordinates","Type","Level","Current owner (if Top 10)"]:
+    kind==="current"?["Coordinates","Owner","Type","Level"]:["Observed at","Coordinates","Previous","Current","Observation"];
+  var thead=make("thead",d),tr=make("tr",d);headers.forEach(function(h){tr.appendChild(make("th",d,h));});thead.appendChild(tr);table.appendChild(thead);
+  var tbody=make("tbody",d);table.appendChild(tbody);
+  var ownerByCoord={};current.forEach(function(p){ownerByCoord[p.coord]=p;});
+  var arr=kind==="loss"?losses:kind==="current"?current:changes;
+  var count=0;
+  arr.forEach(function(p){
+   if(k&&p.coord!==k)return;
+   var owner=kind==="loss"?ownerByCoord[p.coord]:p;
+   if(aid&&String(owner&&owner.ownerId)!==aid)return;
+   var vals=kind==="loss"?[time(p.when),p.coord,TYPES[p.type]||("Type "+p.type),p.level==null?"—":p.level,owner?owner.owner:"Unknown / outside Top 10"]:
+     kind==="current"?[p.coord,p.owner,TYPES[p.type]||("Type "+p.type),p.level==null?"—":p.level]:
+     [time(p.when),p.coord,p.previous,p.current,p.kind];
+   var row=make("tr",d);vals.forEach(function(v){var td=make("td",d,v);if(kind!=="changes"&&String(v)===TYPES[p.type]){td.style.color=COLORS[p.type]||"";td.style.fontWeight="bold";}row.appendChild(td);});tbody.appendChild(row);count++;
+  });
+  status.textContent=(busy?"Loading… ":"")+(loaded?"Last checked: "+new Date(readSaved().lastCheck||Date.now()).toLocaleString()+". ":"")+count+" displayed record(s). "+(errors.length?"Warnings: "+errors.join(" | "):"");
+ }
+ view.onchange=draw;alliance.onchange=draw;search.oninput=draw;refreshBtn.onclick=function(){refresh();};
+ draw();
+}
+function openWindow(){
+ win=window.open("","_blank");
+ if(!win){alert("Allow popups for the game site to view POI data.");return;}
+ win.document.open();win.document.write("<!doctype html><html><head><meta charset='utf-8'><title>POI Owner Resolver</title></head><body></body></html>");win.document.close();
+ render(win.document);
+}
+function buttonSetup(){
+ if(document.getElementById("poi-owner-v2"))return;
+ button=document.createElement("button");button.id="poi-owner-v2";button.textContent="POI Owner Search";
+ button.style.cssText="position:fixed;right:8px;bottom:52px;z-index:100000;background:#d00000;color:#ffff00;border:2px solid #ffff00;border-radius:7px;padding:8px 14px;cursor:pointer;font:bold 13px Arial;user-select:none";
+ var pos=readSaved().buttonPos;if(pos){button.style.left=pos.left+"px";button.style.top=pos.top+"px";button.style.right="auto";button.style.bottom="auto";}
+ var down=false,moved=false,dx=0,dy=0;
+ button.addEventListener("mousedown",function(e){if(e.button)return;down=true;moved=false;var r=button.getBoundingClientRect();dx=e.clientX-r.left;dy=e.clientY-r.top;button.style.left=r.left+"px";button.style.top=r.top+"px";button.style.right="auto";button.style.bottom="auto";e.preventDefault();});
+ document.addEventListener("mousemove",function(e){if(!down)return;var x=Math.max(0,Math.min(innerWidth-button.offsetWidth,e.clientX-dx)),y=Math.max(0,Math.min(innerHeight-button.offsetHeight,e.clientY-dy));if(Math.abs(x-parseFloat(button.style.left))>2||Math.abs(y-parseFloat(button.style.top))>2)moved=true;button.style.left=x+"px";button.style.top=y+"px";});
+ document.addEventListener("mouseup",function(){if(!down)return;down=false;if(moved){var saved=readSaved();saved.buttonPos={left:parseFloat(button.style.left),top:parseFloat(button.style.top)};save(saved);}});
+ button.addEventListener("click",function(){if(moved){moved=false;return;}openWindow();});
+ document.body.appendChild(button);
+}
+function wait(){
+ try{if(typeof qx!=="undefined"&&typeof ClientLib!=="undefined"&&typeof webfrontend!=="undefined"&&qx.core.Init.getApplication()&&ClientLib.Data.MainData.GetInstance().get_Player().get_Name()){buttonSetup();refresh();return;}}catch(e){}
+ setTimeout(wait,1000);
+}
+log("Script loaded");wait();
+})();
