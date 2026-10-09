@@ -1,0 +1,173 @@
+// ==UserScript==
+// @name         Tiberium Alliances - POI Coord Owner Resolver
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  Searchable POI coordinate/owner resolver for the top 10 alliances.
+// @match        https://*.alliances.commandandconquer.com/*/index.aspx*
+// @match        https://*.alliances.commandandconquer.com/*
+// @grant        none
+// @run-at       document-idle
+// @sandbox      raw
+// ==/UserScript==
+
+(function () {
+'use strict';
+var coordStore={}, allianceData={}, coordOwner={}, top10Order=[];
+var totalPages=0,pagesLoaded=0,totalAlliances=0,alliancesLoaded=0,ownersResolved=false,started=false;
+
+function delegate(fn){return webfrontend.phe.cnc.Util.createEventDelegate(ClientLib.Net.CommandResult,window,fn);}
+function getPValue(p,field,value){if(!p||!p.length)return null;for(var j=0;j<p.length;j++)if(p[j][field]===value)return p[j].v;return null;}
+
+function maybeResolve(){
+ if(ownersResolved)return;
+ var notificationsDone=(totalPages===0)||(pagesLoaded>=totalPages);
+ var alliancesDone=(totalAlliances===0)||(alliancesLoaded>=totalAlliances);
+ if(!notificationsDone||!alliancesDone)return;
+ ownersResolved=true;
+ for(var key in coordStore){
+  if(!Object.prototype.hasOwnProperty.call(coordStore,key))continue;
+  var owner=coordOwner[key];
+  coordStore[key].owner=owner?owner.name:"owner unknown";
+  coordStore[key].ownerId=owner?owner.id:null;
+ }
+ window.POICoordOwnerResolver={coordStore:coordStore,allianceData:allianceData,coordOwner:coordOwner,top10Order:top10Order};
+ console.log("[POI Owner Resolver] Complete:",coordStore);
+}
+
+function onCount(n,t){
+ var total=Number(t)||0,pageSize=100;
+ console.log("[POI Owner Resolver] notifications:",total);
+ if(total<=0){totalPages=0;pagesLoaded=0;maybeResolve();return;}
+ totalPages=Math.ceil(total/pageSize); pagesLoaded=0;
+ for(var from=0;from<total;from+=pageSize) loadRows(from,Math.min(from+pageSize-1,total-1));
+}
+function loadRows(n,t){
+ ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand("NotificationGetRange",
+ {category:7,skip:n,take:t-n+1,sortOrder:0,ascending:false},delegate(onRows),null);
+}
+function onRows(i,u){
+ if(u&&u.length)for(var r=0;r<u.length;r++){
+  var row=u[r]; if(row.mdb!==45)continue;
+  var v=getPValue(row.p,"t","co"); if(v==null)continue;
+  var x=(v>>16)&65535,y=v&65535;
+  coordStore[x+","+y]={x:x,y:y,owner:"resolving..."};
+ }
+ pagesLoaded++; maybeResolve();
+}
+
+function loadRanking(){
+ ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand("RankingGetData",
+ {ascending:true,firstIndex:0,lastIndex:9,rankingType:0,searchValue:"",sortColumn:2,view:1},
+ delegate(onRanking),null);
+}
+function onRanking(n,t){
+ if(!t||!t.a||!t.a.length){console.warn("[POI Owner Resolver] No ranking data.");totalAlliances=0;alliancesLoaded=0;maybeResolve();return;}
+ totalAlliances=t.a.length;alliancesLoaded=0;top10Order=[];
+ for(var i=0;i<t.a.length;i++){
+  if(t.a[i].a==null){alliancesLoaded++;continue;}
+  top10Order.push(t.a[i].a); loadAlliance(t.a[i].a);
+ }
+ maybeResolve();
+}
+function loadAlliance(id){
+ ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand("GetPublicAllianceInfo",{id:id},delegate(onAlliance),null);
+}
+function onAlliance(n,t){
+ try{
+  if(!t||t.i==null){console.warn("[POI Owner Resolver] Invalid alliance response:",t);return;}
+  var id=t.i,name=t.n||("Alliance "+id);
+  var entry=allianceData[id]||(allianceData[id]={id:id,name:name,pois:[]});
+  entry.pois=[];
+  if(t.opois&&t.opois.length)for(var i=0;i<t.opois.length;i++){
+   var p=t.opois[i]; if(p.x==null||p.y==null)continue;
+   entry.pois.push({x:p.x,y:p.y,type:p.t,level:p.l});
+   coordOwner[p.x+","+p.y]={id:id,name:name};
+  }
+ }catch(e){console.error("[POI Owner Resolver] alliance callback failed:",e,t);}
+ finally{alliancesLoaded++;maybeResolve();}
+}
+
+
+function esc(v){return String(v==null?"":v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function normalizeCoord(v){
+ var m=String(v||"").trim().match(/^(\d{1,3})\s*[:,\s]\s*(\d{1,3})$/);
+ return m?(parseInt(m[1],10)+","+parseInt(m[2],10)):null;
+}
+function findPOIDetails(key){
+ var owner=coordOwner[key], detail=null;
+ if(owner&&allianceData[owner.id]){
+  var ps=allianceData[owner.id].pois;
+  for(var i=0;i<ps.length;i++)if(ps[i].x+","+ps[i].y===key){detail=ps[i];break;}
+ }
+ return {owner:owner,detail:detail};
+}
+function openResolverWindow(){
+ var w=window.open("","_blank");
+ if(!w){alert("Please allow pop-ups for Tiberium Alliances.");return;}
+ var rows=[];
+ for(var key in coordStore)if(Object.prototype.hasOwnProperty.call(coordStore,key)){
+  var c=coordStore[key],f=findPOIDetails(key);
+  rows.push({key:key,x:c.x,y:c.y,owner:c.owner||"owner unknown",ownerId:c.ownerId,detail:f.detail});
+ }
+ rows.sort(function(a,b){return a.x-b.x||a.y-b.y;});
+ var options='<option value="">All Top 10 Alliances</option>';
+ for(var q=0;q<top10Order.length;q++){
+  var aid=top10Order[q],ad=allianceData[aid];
+  if(ad)options+='<option value="'+aid+'">'+esc(ad.name)+'</option>';
+ }
+ var html='<!doctype html><html><head><meta charset="utf-8"><title>POI Owner Search</title><style>'+
+ 'body{font-family:Segoe UI,Arial,sans-serif;background:#f2f4f8;margin:0;padding:18px;color:#252a34}'+
+ '.panel{background:white;border:1px solid #d8dde7;border-radius:9px;padding:16px;box-shadow:0 2px 8px #0002}'+
+ 'h2{margin:0 0 12px}.controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}'+
+ 'input,select,button{font:14px Segoe UI,Arial;padding:7px 9px;border:1px solid #bfc7d4;border-radius:5px}'+
+ 'button{background:#d00000;color:#ffff00;border-color:#a40000;font-weight:700;cursor:pointer}'+
+ '.status{margin:8px 0 12px;color:#5a6273}table{width:100%;border-collapse:collapse;font-size:13px}'+
+ 'th{background:#2b2f3a;color:white;text-align:left;padding:8px}td{padding:7px 8px;border-bottom:1px solid #e8ebf0}'+
+ 'tr:nth-child(even){background:#f8fafc}.coord{font-family:Consolas,monospace;font-weight:700}</style></head><body>'+
+ '<div class="panel"><h2>POI Coordinate Owner Search</h2><div class="controls">'+
+ '<input id="coord" placeholder="Coords: 123:456" autofocus><select id="alliance">'+options+'</select>'+
+ '<button id="search">Search</button><button id="clear">Clear</button></div>'+
+ '<div id="status" class="status"></div><table><thead><tr><th>Coords</th><th>Current Owner</th><th>POI Type</th><th>Level</th></tr></thead><tbody id="body"></tbody></table></div>'+
+ '<script>var DATA='+JSON.stringify(rows)+';'+
+ 'function render(){var q=document.getElementById("coord").value.trim();var aid=document.getElementById("alliance").value;'+
+ 'var m=q.match(/^(\\d{1,3})\\s*[:,\\s]\\s*(\\d{1,3})$/);var key=m?(parseInt(m[1],10)+","+parseInt(m[2],10)):"";'+
+ 'var a=DATA.filter(function(r){return (!key||r.key===key)&&(!aid||String(r.ownerId)===aid)});'+
+ 'document.getElementById("status").textContent=a.length+" matching POI coordinate"+(a.length===1?"":"s")+".";'+
+ 'document.getElementById("body").innerHTML=a.map(function(r){return "<tr><td class=coord>"+r.x+":"+r.y+"</td><td>"+(r.owner||"owner unknown")+"</td><td>"+(r.detail&&r.detail.type!=null?r.detail.type:"—")+"</td><td>"+(r.detail&&r.detail.level!=null?r.detail.level:"—")+"</td></tr>"}).join("");}'+
+ 'document.getElementById("search").onclick=render;document.getElementById("clear").onclick=function(){document.getElementById("coord").value="";document.getElementById("alliance").value="";render()};'+
+ 'document.getElementById("coord").onkeydown=function(e){if(e.key==="Enter")render()};render();<\/script></body></html>';
+ w.document.open();w.document.write(html);w.document.close();
+}
+function addFloatingButton(){
+ if(document.getElementById("poi-owner-resolver-btn"))return;
+ var btn=document.createElement("button");
+ btn.id="poi-owner-resolver-btn";btn.textContent="POI Owner Search";
+ btn.style.cssText="position:fixed;right:8px;bottom:52px;z-index:100000;padding:8px 14px;background:#d00000;color:#ffff00;border:2px solid #ffff00;border-radius:7px;cursor:pointer;font:bold 13px Arial;box-shadow:0 2px 8px rgba(0,0,0,.45);user-select:none";
+ try{var sv=JSON.parse(localStorage.getItem("poiOwnerResolverButtonPosition"));if(sv&&sv.left!=null&&sv.top!=null){btn.style.left=sv.left+"px";btn.style.top=sv.top+"px";btn.style.right="auto";btn.style.bottom="auto";}}catch(e){}
+ var dragging=false,moved=false,ox=0,oy=0;
+ btn.addEventListener("mousedown",function(e){if(e.button!==0)return;dragging=true;moved=false;var r=btn.getBoundingClientRect();ox=e.clientX-r.left;oy=e.clientY-r.top;btn.style.left=r.left+"px";btn.style.top=r.top+"px";btn.style.right="auto";btn.style.bottom="auto";e.preventDefault();});
+ document.addEventListener("mousemove",function(e){if(!dragging)return;moved=true;var l=Math.max(0,Math.min(e.clientX-ox,window.innerWidth-btn.offsetWidth));var t=Math.max(0,Math.min(e.clientY-oy,window.innerHeight-btn.offsetHeight));btn.style.left=l+"px";btn.style.top=t+"px";});
+ document.addEventListener("mouseup",function(){if(!dragging)return;dragging=false;if(moved)try{localStorage.setItem("poiOwnerResolverButtonPosition",JSON.stringify({left:parseInt(btn.style.left,10),top:parseInt(btn.style.top,10)}));}catch(e){}});
+ btn.addEventListener("click",function(){if(moved){moved=false;return;}if(!ownersResolved){alert("POI owner data is still loading. Please try again in a few seconds.");return;}openResolverWindow();});
+ document.body.appendChild(btn);
+}
+
+function build(){
+ if(started)return;started=true;
+ console.log("[POI Owner Resolver] Starting...");
+ ClientLib.Net.CommunicationManager.GetInstance().SendSimpleCommand("NotificationGetCount",{category:7},delegate(onCount),null);
+ loadRanking();
+}
+function waitForGame(){
+ try{
+  if(typeof qx!=="undefined"&&typeof ClientLib!=="undefined"&&typeof webfrontend!=="undefined"&&
+     qx.core.Init.getApplication()&&ClientLib.Data.MainData.GetInstance().get_Player()&&
+     ClientLib.Data.MainData.GetInstance().get_Player().get_Name()){
+    console.log("[POI Owner Resolver] Game ready.");addFloatingButton();build();return;
+  }
+ }catch(e){}
+ setTimeout(waitForGame,1000);
+}
+console.log("[POI Owner Resolver] Tampermonkey script loaded.");
+waitForGame();
+})();
